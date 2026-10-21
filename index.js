@@ -1,3 +1,4 @@
+// sage_experience v1.1.0 — bounded format retries and cancellation
 // xz-data-manager-host:start
 (function installDataManager(payload) {
     const host=window.parent?.SillyTavern ? window.parent : window;
@@ -1632,9 +1633,9 @@ function installApiProgress(){
     let dead=false,sequence=0,last='',lastUntil=0,expiry=null,main=null;
     const helpers=new Map();
     const emit=()=>window.dispatchEvent(new Event('xz-api-activity-changed'));
-    function begin(module){
+    function begin(module,retry=0){
         if(dead)return ()=>{};
-        const id=++sequence,label=labels[module]||module;tasks.set(id,label);emit();let ended=false;
+        const id=++sequence,label=(labels[module]||module)+(retry?'（第 '+retry+'/5 次重试）':'');tasks.set(id,label);emit();let ended=false;
         return error=>{if(ended)return;ended=true;if(!tasks.delete(id))return;last=label+(error?'失败':'完成');lastUntil=Date.now()+3500;clearTimeout(expiry);expiry=setTimeout(emit,3500);emit();};
     }
     const original=window.fetch;
@@ -1756,7 +1757,31 @@ function installSharedApi() {
             window.dispatchEvent(new Event('xz-reincarnation-mvu-settings-changed'));return copy(next);
         }finally{saving=false;}
     }
-    async function request(module,messages,{signal,id,timeout}={}){
+    const activeRequests=new Set();
+    function retryable(message){return /模型未返回有效文本|模型回复被截断|填表标签不完整|填表结果不是受支持的完整 SQL|SQL 语句缺少分号|召回结果须为 JSON|交火关键词缺少有效|JSON|Unexpected end|Unterminated/i.test(message);}
+    async function withRetries(module,options,send){
+        const controller=new AbortController(),cancel=()=>controller.abort(),signal=controller.signal;
+        let progress=null;
+        const snapshot=()=>JSON.stringify([ctx().chatId,ctx().characterId,ctx().groupId,resolve(module,options.id)]),initial=snapshot();
+        const check=()=>{if(signal.aborted)throw Error('请求已取消');if(snapshot()!==initial)throw Error('聊天或 API 配置已变化，已停止重试');};
+        if(options.signal?.aborted)cancel();options.signal?.addEventListener('abort',cancel,{once:true});activeRequests.add(controller);
+        try{for(let attempt=0;;attempt++){
+            check();await options.guard?.();check();
+            progress?.();progress=window.XZ_API_ACTIVITY?.begin(module,attempt);
+            try{
+                const value=await send({...options,signal});check();await options.guard?.();check();
+                if(options.validate){try{await options.validate(value);}catch(e){if(retryable(e.message))e.responseFormat=true;throw e;}}
+                check();return value;
+            }catch(e){
+                check();
+                if(attempt>=5||(/content_filter|余额|Payment Required|HTTP|取消/.test(e.message))||!(e.responseFormat||retryable(e.message)||e instanceof SyntaxError))throw e;
+            }
+            await new Promise((resolve,reject)=>{const stop=()=>{clearTimeout(timer);signal.removeEventListener('abort',stop);reject(Error('请求已取消'));};const timer=setTimeout(()=>{signal.removeEventListener('abort',stop);resolve();},1000);signal.addEventListener('abort',stop,{once:true});if(signal.aborted)stop();});
+        }}finally{activeRequests.delete(controller);options.signal?.removeEventListener('abort',cancel);progress?.();}
+    }
+    async function request(module,messages,options={}){return withRetries(module,options,o=>requestOnce(module,messages,o));}
+    async function structured(module,kind,payload,options={}){return withRetries(module,options,o=>structuredOnce(module,kind,payload,o));}
+    async function requestOnce(module,messages,{signal,id,timeout}={}){
         const p=resolve(module,id),controller=new AbortController(),cancel=()=>controller.abort(),end=window.XZ_API_ACTIVITY?.begin(module);
         if(signal?.aborted)cancel();signal?.addEventListener('abort',cancel,{once:true});const timer=setTimeout(cancel,timeout??p.timeoutSeconds*1000);
         try{
@@ -1765,12 +1790,12 @@ function installSharedApi() {
             const j=await r.json(),choice=j.choices?.[0],text=choice?.message?.content;
             if(j?.error){const reason=String(j.error?.message||j.error?.detail||'');if(/Payment Required|insufficient balance/i.test(reason))throw Error('上游拒绝请求：余额不足或支付要求（Payment Required），本次未取得模型结果');throw Error('上游返回错误对象，本次未取得有效模型结果；请检查服务商请求日志');}
             if(choice?.finish_reason==='content_filter')throw Error('上游以 content_filter 结束，输出可能截断；本次不进行格式补全或保存，请检查服务商日志');
-            if(typeof text!=='string'||!text.trim())throw Error('模型未返回有效文本');
+            if(typeof text!=='string'||!text.trim())throw Object.assign(Error('模型未返回有效文本'),{responseFormat:true});
             if(choice.finish_reason==='length')throw Error('模型回复被截断，请提高回复上限后重试');return text;
         }catch(e){end?.(true);if(controller.signal.aborted)throw Error(signal?.aborted?'请求已取消':'模型请求超时');if(e instanceof TypeError)throw Error('模型连接失败，请检查 API 配置');throw e;}
         finally{end?.();clearTimeout(timer);signal?.removeEventListener('abort',cancel);}
     }
-    async function structured(module,kind,payload,{signal,timeout}={}){
+    async function structuredOnce(module,kind,payload,{signal,timeout}={}){
         if(!['embeddings','rerank'].includes(kind))throw Error('不支持的接口类型');
         const p=resolve(module),controller=new AbortController(),cancel=()=>controller.abort(),end=window.XZ_API_ACTIVITY?.begin(module);
         if(signal?.aborted)cancel();signal?.addEventListener('abort',cancel,{once:true});const timer=setTimeout(cancel,timeout??p.timeoutSeconds*1000);
@@ -1783,7 +1808,7 @@ function installSharedApi() {
         finally{end?.();clearTimeout(timer);signal?.removeEventListener('abort',cancel);}
     }
     async function models(p){const end=window.XZ_API_ACTIVITY?.begin('models'),controller=new AbortController(),timer=setTimeout(()=>controller.abort(),20000);try{const r=await fetch('/api/backends/chat-completions/status',{method:'POST',xzTask:true,headers:ctx().getRequestHeaders(),signal:controller.signal,body:JSON.stringify({chat_completion_source:'openai',reverse_proxy:url(p.url),proxy_password:String(p.key||'')})});if(!r.ok)throw Error('拉取模型失败');const j=await r.json(),rows=Array.isArray(j)?j:j.data||j.models;if(!Array.isArray(rows))throw Error('未返回模型列表，可手动填写');return [...new Set(rows.map(x=>typeof x==='string'?x:x.id||x.name).filter(Boolean))].sort();}catch(e){end?.(true);throw e;}finally{end?.();clearTimeout(timer);}}
-    window.XZ_API={version:1,defaults,read,save,remove,saveMemorySettings,reincarnationMvuDefaults,readReincarnationMvuSettings,saveReincarnationMvuSettings,bind,binding,resolve,request,structured,models,bound:module=>!!read().bindings[module]};return window.XZ_API;
+    window.XZ_API={version:1,cancelAll(){for(const c of activeRequests)c.abort();},defaults,read,save,remove,saveMemorySettings,reincarnationMvuDefaults,readReincarnationMvuSettings,saveReincarnationMvuSettings,bind,binding,resolve,request,structured,models,bound:module=>!!read().bindings[module]};return window.XZ_API;
 }
 
 // Pure transformations: imported rows are lossless; model SQL is parsed, never executed.
@@ -2110,7 +2135,7 @@ function installMemoryManager(defaultPrompts={"xianzi": [{"role": "SYSTEM", "con
             if(!config.prompt.some(p=>p.content.includes('$1')))messages.push({role:'user',content:'<正文数据>'+text+'</正文数据>'});
             messages.push({role:'user',content:values.$8});
             emit('正在填写第 '+(a+1)+'～'+(b+1)+' 楼（'+offset+'/'+planned.pending+' 段）');
-            const answer=await window.XZ_API.request('memory',messages,{id:apiId(),signal:controller.signal});check(s);
+            const answer=await window.XZ_API.request('memory',messages,{id:apiId(),signal:controller.signal,guard:()=>{check(s);if(!equal(chat.map(fingerprint),signature))throw Error('聊天内容已变化');},validate:answer=>core.parseSql(answer)});check(s);
             if(!equal(chat.map(fingerprint),signature))throw Error('聊天内容已变化，本段结果未保存');
             const rows=core.parseSql(answer),codes=new Set(current.map(r=>r.code).filter(Boolean));
             for(const r of rows){if(r.code&&codes.has(r.code))throw Error('模型返回重复纪要编号，本段未保存');if(r.code)codes.add(r.code);}
@@ -2320,7 +2345,7 @@ function installRecallManager(){
                 }else prepared.push(route);
             }
             stage='recall';await guard();status='正在筛选相关纪要…';emit();
-            const done=await core.run(prepared,pending.done,route=>api.request(route.id==='anchor'?'anchorRecall':'recall',core.messages(route.prompt,job.context,route.records,route.config,route.background),{id:route.profile.id,signal:controller.signal}),async done=>{persist({...pending,status:'pending',done,error:''});},guard);
+            const done=await core.run(prepared,pending.done,route=>api.request(route.id==='anchor'?'anchorRecall':'recall',core.messages(route.prompt,job.context,route.records,route.config,route.background),{id:route.profile.id,signal:controller.signal,guard,validate:answer=>core.selection(answer,route.records,route.config)}),async done=>{persist({...pending,status:'pending',done,error:''});},guard);
             await guard();
             const anchorIdentity=job.routes.find(r=>r.id==='anchor')?.reincarnation;
             const identityNote=anchorIdentity?'轮回记忆中的来源人物已按当前前缀标记；下面身份表中 owner=user 指向本局 {{user}}，历史姓名不是第二个玩家；owner=historical-only 的人没有被携带，只能作为来源历史，不得创建或更新其 MVU。只转换来源名册中登记的完整姓名，不推测昵称或其他未知人名。\n'+JSON.stringify({reincarnation_history_identities:createReincarnationMvuCore().recallIdentities(anchorIdentity)})+'\n':'';
@@ -2370,7 +2395,7 @@ function installRecallManager(){
     on(events.CHAT_CHANGED,()=>{cancel();storage='';pending=null;status='';sessionInjection=null;if(active())void load().then(emit).catch(()=>{});});
     on(events.GENERATION_STOPPED,id=>{if(!id&&!blocking)cancel();});
     const invalidate=()=>{cancel();emit();};window.addEventListener('xz-api-changed',invalidate);window.addEventListener('xz-memory-settings-changed',invalidate);
-    const service=window.XZ_RECALL={config,configure,state,retry,results,injectionAt,injections,latestInjection,load,gate,get busy(){return busy;},destroy(){dead=true;cancel();for(const [n,f]of listeners)source.removeListener(n,f);window.removeEventListener('xz-api-changed',invalidate);window.removeEventListener('xz-memory-settings-changed',invalidate);if(window.XZ_RECALL===service)delete window.XZ_RECALL;}};
+    const service=window.XZ_RECALL={stop(){controller?.abort();},config,configure,state,retry,results,injectionAt,injections,latestInjection,load,gate,get busy(){return busy;},destroy(){dead=true;cancel();for(const [n,f]of listeners)source.removeListener(n,f);window.removeEventListener('xz-api-changed',invalidate);window.removeEventListener('xz-memory-settings-changed',invalidate);if(window.XZ_RECALL===service)delete window.XZ_RECALL;}};
     void load().then(emit).catch(e=>{status=e.message;emit();});return service;
 }
 
@@ -2412,9 +2437,10 @@ function installRecallDisplay(){
     style.textContent+=`#xz-recall-progress{position:fixed;z-index:2147483647;bottom:110px;left:50%;transform:translateX(-50%);max-width:calc(100vw - 32px);padding:10px 16px;border:1px solid #80966c;border-radius:12px;background:#f6f3e8;color:#354337;box-shadow:0 5px 20px #0003;font:14px/1.6 system-ui;display:flex;align-items:center;gap:10px;pointer-events:none}#xz-recall-progress[hidden]{display:none}#xz-recall-progress button{pointer-events:auto;border:1px solid #80966c;border-radius:6px;padding:4px 10px;background:#fffdf7;color:#3f614b;cursor:pointer}#xz-recall-progress[data-busy=true]::before{content:'';width:14px;height:14px;flex:none;border:2px solid #3f614b44;border-top-color:#3f614b;border-radius:50%;animation:xz-recall-spin 1s linear infinite}@keyframes xz-recall-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){#xz-recall-progress[data-busy=true]::before{animation:none}}`;
     document.head.append(style);
     const node=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};
-    const progress=node('div'),progressText=node('span'),retry=node('button','重试');progress.id='xz-recall-progress';progress.hidden=true;progress.setAttribute('role','status');progress.setAttribute('aria-live','polite');retry.type='button';retry.hidden=true;retry.onclick=()=>window.XZ_RETRY_MANAGER?.open(null,retry);progress.append(progressText,retry);document.body.append(progress);
+    const progress=node('div'),progressText=node('span'),retry=node('button','重试');progress.id='xz-recall-progress';progress.hidden=true;progress.setAttribute('role','status');progress.setAttribute('aria-live','polite');retry.type='button';retry.hidden=true;retry.onclick=()=>window.XZ_RETRY_MANAGER?.open(null,retry);const terminate=node('button','终止');terminate.type='button';terminate.onclick=()=>{window.XZ_MEMORY?.stop();window.XZ_RECALL?.stop();window.XZ_REINCARNATION_MVU?.stop();window.XZ_API?.cancelAll();terminate.disabled=true;progressText.textContent='正在终止请求…';};progress.append(progressText,retry,terminate);document.body.append(progress);
     function progressState(state){
         const activity=window.XZ_API_ACTIVITY?.state(),dual=window.XZ_REINCARNATION_MVU?.state();
+        terminate.hidden=!(activity?.labels.length||dual?.busy||state.busy);terminate.disabled=false;
         if(activity?.labels.length||dual?.busy){clearTimeout(successTimer);successTimer=null;progress.hidden=false;progress.dataset.busy='true';progressText.textContent=activity?.labels.length?[...new Set(activity.labels)].map(label=>'正在'+label+'…').join(' · '):dual.status||'正在保存 MVU 状态…';retry.hidden=true;wasBusy=wasBusy||state.busy;return;}
         if(dual?.active&&dual.failed){progress.hidden=false;progress.dataset.busy='false';progressText.textContent='MVU 更新未完成，请重试失败请求。';retry.hidden=false;return;}
 
@@ -2723,7 +2749,7 @@ function installCrossfireManager(){
             if(c.keywordEnabled){
                 await guard();const prompts=window.XZ_MEMORY_CORE.prompts(spec.prompt).filter(p=>p.enabled!==false).map(p=>({role:p.role.toLowerCase(),content:p.content.replace(/\$RECENT_CONTEXT|\$USER_INPUT/g,key=>key==='$USER_INPUT'?current:JSON.stringify(recent))}));
                 if(!spec.prompt.some(p=>/\$RECENT_CONTEXT|\$USER_INPUT/.test(p.content)))prompts.push({role:'user',content:JSON.stringify({context:recent,user_input:current})});
-                const answer=await api.request('crossfireKeyword',prompts,{signal}),blocks=[...answer.matchAll(/<keywords>([\s\S]*?)<\/keywords>/g)];
+                const answer=await api.request('crossfireKeyword',prompts,{signal,guard,validate:answer=>{const b=[...answer.matchAll(/<keywords>([\s\S]*?)<\/keywords>/g)];if(b.length!==1||!b[0][1].trim())throw Error('交火关键词缺少有效的 <keywords> 标签');}}),blocks=[...answer.matchAll(/<keywords>([\s\S]*?)<\/keywords>/g)];
                 if(blocks.length!==1||!blocks[0][1].trim())throw Error('交火关键词缺少有效的 <keywords> 标签');keywords=blocks[0][1].trim();
             }
             cp.query=[current,keywords].filter(Boolean).join('\n');if(!cp.query.trim())throw Error('交火检索缺少当前输入');await checkpoint();
@@ -3108,7 +3134,7 @@ function installReincarnationMvu(){
                     if(job.done[route]?.configHash===configHash){core.applyPatch(job.base,job.done[route].ops,route,v);await bridge.validateDual(job.base,job.done[route].ops);await check();continue;}
                     delete job.done[route];
                     status=route==='normal'?'正在更新普通人物…':'正在更新轮回玩家与携带人物…';emit();
-                    const result=await window.XZ_API.request(route==='normal'?'mvu':'reincarnationMvu',messages(job,route,v,ruleText,retryHints[route]||''),{signal:controller.signal});await check();
+                    const result=await window.XZ_API.request(route==='normal'?'mvu':'reincarnationMvu',messages(job,route,v,ruleText,retryHints[route]||''),{signal:controller.signal,guard:check,validate:result=>parse(result)});await check();
                     if(configHash!==await profileHash(route))throw Error('API 或提示词已变化，请重试此路');
                     const ops=core.normalizePatch(job.base,parse(result),route,v);core.applyPatch(job.base,ops,route,v);await bridge.validateDual(job.base,ops);await check();job.done[route]={configHash,ops};await persist(job,s,check);
                 }catch(e){await check();job.errors[route]=e.message;delete job.done[route];await persist(job,s,check);}
@@ -3162,7 +3188,7 @@ function installReincarnationMvu(){
     };
     for(const name of [events.MESSAGE_DELETED,events.MESSAGE_EDITED,events.MESSAGE_UPDATED,events.MESSAGE_SWIPED])on(name,discardStale);
     on(events.CHAT_CHANGED,()=>{epoch++;controller?.abort();busy=false;controller=null;runningTarget=null;lastMain=false;blocked=false;blockedTask=null;historyCache=[];status='';emit();});
-    const api={...core,version:1,active,opening(){const v=value();return v?{prefix:core.prefixOf(v),player:clone(v.player.state),characters:clone(v.characters)}:null;},applyOpening(data){const v=value();return v?core.applyOpening(data,v):data;},update:run,retry,gate,floorState(mid){return {done:active()&&Number.isInteger(mid)&&mid>=0&&mid<ctx().chat.length&&doneFor(mid)&&!(mid===latestReply()&&unfinished()),busy:busy&&runningTarget?.mid===mid,status:mid===latestReply()?status:''};},state:()=>{const p=pending(),failed=active()&&!busy&&unfinished();return {active:active(),busy,pending:p,status:busy||p||failed?status:'',failed};},nativeSnapshot(text){if(!active())return null;const matches=ctx().chat.map((m,i)=>clean(m.mes)===clean(text)?i:-1).filter(i=>i>=0);if(matches.length!==1)throw Error('无法唯一确认原生 MVU 更新楼层，请使用统一重试');return bagAt(matches[0]);},get busy(){return busy;},destroy(){dead=true;epoch++;controller?.abort();for(const [n,f]of listeners)source.removeListener(n,f);if(window.XZ_REINCARNATION_MVU===api)delete window.XZ_REINCARNATION_MVU;}};
+    const api={...core,version:1,stop(){controller?.abort();},active,opening(){const v=value();return v?{prefix:core.prefixOf(v),player:clone(v.player.state),characters:clone(v.characters)}:null;},applyOpening(data){const v=value();return v?core.applyOpening(data,v):data;},update:run,retry,gate,floorState(mid){return {done:active()&&Number.isInteger(mid)&&mid>=0&&mid<ctx().chat.length&&doneFor(mid)&&!(mid===latestReply()&&unfinished()),busy:busy&&runningTarget?.mid===mid,status:mid===latestReply()?status:''};},state:()=>{const p=pending(),failed=active()&&!busy&&unfinished();return {active:active(),busy,pending:p,status:busy||p||failed?status:'',failed};},nativeSnapshot(text){if(!active())return null;const matches=ctx().chat.map((m,i)=>clean(m.mes)===clean(text)?i:-1).filter(i=>i>=0);if(matches.length!==1)throw Error('无法唯一确认原生 MVU 更新楼层，请使用统一重试');return bagAt(matches[0]);},get busy(){return busy;},destroy(){dead=true;epoch++;controller?.abort();for(const [n,f]of listeners)source.removeListener(n,f);if(window.XZ_REINCARNATION_MVU===api)delete window.XZ_REINCARNATION_MVU;}};
     window.XZ_REINCARNATION_MVU=api;return api;
 }
 
